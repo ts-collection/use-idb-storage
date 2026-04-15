@@ -13,11 +13,13 @@ import type { IDBConfigValues } from './types';
  */
 export const IDBConfig = ({
   children,
-  ...conf
+  database,
+  version,
+  store,
 }: { children: React.ReactNode } & Partial<IDBConfigValues>) => {
   React.useEffect(() => {
-    configureIDBStorage(conf);
-  }, [conf]);
+    configureIDBStorage({ database, version, store });
+  }, [database, version, store]);
 
   return children;
 };

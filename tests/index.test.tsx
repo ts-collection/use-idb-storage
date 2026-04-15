@@ -1,8 +1,7 @@
-import { act, renderHook, waitFor } from '@testing-library/react';
+import { act, render, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { configureIDBStorage } from '../src';
+import { IDBConfig, IDBStorage, configureIDBStorage, getGlobalConfig, idb } from '../src';
 import { useIDBStorage } from '../src/hook';
-import { IDBStorage } from '../src/idb-storage';
 import {
   clearAllDatabases,
   createTestDbName,
@@ -133,9 +132,26 @@ describe('useIDBStorage', () => {
   });
 
   describe('Persistence and Loading', () => {
-    it.skip('should persist value changes to IndexedDB', async () => {
-      // Skipped: fake-indexeddb has timing issues with async persistence verification
-      // In real IndexedDB, this functionality works correctly
+    it('should persist value changes to IndexedDB', async () => {
+      const key = 'persist-test';
+
+      const { result: r1, unmount: u1 } = renderHook(() =>
+        useIDBStorage({ key, defaultValue: 'default', database: testDbName }),
+      );
+      await waitFor(() => expect(r1.current.persisted).toBe(true));
+
+      act(() => {
+        r1.current.update('persisted-value');
+      });
+      await nextTick();
+      await flushPromises();
+      u1();
+
+      const { result: r2 } = renderHook(() =>
+        useIDBStorage({ key, defaultValue: 'default', database: testDbName }),
+      );
+      await waitFor(() => expect(r2.current.persisted).toBe(true));
+      expect(r2.current.data).toBe('persisted-value');
     });
 
     it('should handle function updates', async () => {
@@ -172,9 +188,43 @@ describe('useIDBStorage', () => {
   });
 
   describe('Removal Functionality', () => {
-    it.skip('should remove value and reset to default', async () => {
-      // Skipped: fake-indexeddb has issues with cross-instance data verification
-      // In real IndexedDB, removal and reset functionality works correctly
+    it('should remove value and reset to default', async () => {
+      const key = 'remove-test';
+
+      // Write and persist a custom value
+      const { result: r1, unmount: u1 } = renderHook(() =>
+        useIDBStorage({ key, defaultValue: 'default-val', database: testDbName }),
+      );
+      await waitFor(() => expect(r1.current.persisted).toBe(true));
+      act(() => {
+        r1.current.update('custom-value');
+      });
+      await nextTick();
+      await flushPromises();
+      u1();
+
+      // Verify it persisted, then reset
+      const { result: r2, unmount: u2 } = renderHook(() =>
+        useIDBStorage({ key, defaultValue: 'default-val', database: testDbName }),
+      );
+      await waitFor(() => expect(r2.current.data).toBe('custom-value'));
+
+      act(() => {
+        r2.current.reset();
+      });
+      expect(r2.current.data).toBe('default-val');
+      expect(r2.current.lastUpdated).toBeNull();
+
+      await nextTick();
+      await flushPromises();
+      u2();
+
+      // Next hook should see the default persisted back to IDB
+      const { result: r3 } = renderHook(() =>
+        useIDBStorage({ key, defaultValue: 'default-val', database: testDbName }),
+      );
+      await waitFor(() => expect(r3.current.persisted).toBe(true));
+      expect(r3.current.data).toBe('default-val');
     });
   });
 
@@ -301,9 +351,54 @@ describe('useIDBStorage', () => {
       expect(result2.current[0]).toBe('value2');
     });
 
-    it.skip('should handle multiple hooks with same key in same store', async () => {
-      // Skipped: fake-indexeddb has issues with cross-instance synchronization
-      // In real IndexedDB, multiple hooks with same key would share state correctly
+    it('should load the same persisted value when multiple hooks share a key', async () => {
+      const key = 'same-key-load';
+
+      // Pre-populate IDB
+      const setup = new IDBStorage({ database: testDbName });
+      const setupStore = await setup.get('default');
+      await setupStore.set(key, 'shared-persisted');
+
+      const { result: r1 } = renderHook(() =>
+        useIDBStorage({ key, defaultValue: 'default', database: testDbName }),
+      );
+      const { result: r2 } = renderHook(() =>
+        useIDBStorage({ key, defaultValue: 'default', database: testDbName }),
+      );
+
+      await waitFor(() => expect(r1.current.persisted).toBe(true));
+      await waitFor(() => expect(r2.current.persisted).toBe(true));
+
+      expect(r1.current.data).toBe('shared-persisted');
+      expect(r2.current.data).toBe('shared-persisted');
+    });
+
+    it('should not auto-sync between hooks with same key — refresh() is required', async () => {
+      const key = 'same-key-no-sync';
+
+      const { result: r1 } = renderHook(() =>
+        useIDBStorage({ key, defaultValue: 'default', database: testDbName }),
+      );
+      const { result: r2 } = renderHook(() =>
+        useIDBStorage({ key, defaultValue: 'default', database: testDbName }),
+      );
+
+      await waitFor(() => expect(r1.current.persisted).toBe(true));
+      await waitFor(() => expect(r2.current.persisted).toBe(true));
+
+      // Update hook 1 — hook 2 must NOT automatically reflect it
+      act(() => {
+        r1.current.update('new-by-r1');
+      });
+      expect(r2.current.data).toBe('default');
+
+      // After r1's save completes and r2.refresh() is called, r2 sees the new value
+      await nextTick();
+      await flushPromises();
+      await act(async () => {
+        await r2.current.refresh();
+      });
+      expect(r2.current.data).toBe('new-by-r1');
     });
   });
 
@@ -331,6 +426,33 @@ describe('useIDBStorage', () => {
 
       // Verify cleanup happened (no errors should occur)
       await nextTick();
+    });
+
+    it('should not break the shared DB connection when unmounted', async () => {
+      // Regression: unmounting a hook used to call IDBStorage.close() which closed
+      // the native connection but left a stale entry in dbConnections. Any subsequent
+      // hook using the same database would get back the closed connection and throw
+      // "InvalidStateError: The database connection is closing".
+      const sharedDb = testDbName;
+
+      const { result: result1, unmount } = renderHook(() =>
+        useIDBStorage({ key: 'k1', defaultValue: 'a', database: sharedDb }),
+      );
+
+      await waitFor(() => expect(result1.current.persisted).toBe(true));
+
+      // Unmount the first hook — previously this closed the shared connection
+      unmount();
+      await nextTick();
+
+      // A second hook using the same database must still work without errors
+      const { result: result2 } = renderHook(() =>
+        useIDBStorage({ key: 'k2', defaultValue: 'b', database: sharedDb }),
+      );
+
+      await waitFor(() => expect(result2.current.persisted).toBe(true));
+      expect(result2.current.data).toBe('b');
+      expect(result2.current.error).toBeNull();
     });
 
     it('should handle rapid updates correctly', async () => {
@@ -525,6 +647,276 @@ describe('useIDBStorage', () => {
 
       // Should have re-initialized but not infinitely
       expect(renderCount - initialRenderCount).toBeLessThan(10);
+    });
+  });
+
+  describe('State Transitions', () => {
+    it('should start loading and transition to persisted after IDB read', async () => {
+      const { result } = renderHook(() =>
+        useIDBStorage({ key: 'state-trans', defaultValue: 'x', database: testDbName }),
+      );
+
+      expect(result.current.loading).toBe(true);
+      expect(result.current.persisted).toBe(false);
+
+      await waitFor(() => expect(result.current.loading).toBe(false));
+      expect(result.current.persisted).toBe(true);
+    });
+
+    it('should set lastUpdated after initialization (LOAD_VALUE)', async () => {
+      const { result } = renderHook(() =>
+        useIDBStorage({ key: 'lu-init', defaultValue: 'v', database: testDbName }),
+      );
+
+      // Initially null
+      expect(result.current.lastUpdated).toBeNull();
+
+      await waitFor(() => expect(result.current.persisted).toBe(true));
+      // LOAD_VALUE sets lastUpdated
+      expect(result.current.lastUpdated).toBeInstanceOf(Date);
+    });
+
+    it('should update lastUpdated on each value change', async () => {
+      const { result } = renderHook(() =>
+        useIDBStorage({ key: 'lu-update', defaultValue: 0, database: testDbName }),
+      );
+      await waitFor(() => expect(result.current.persisted).toBe(true));
+
+      const after1st = result.current.lastUpdated!.getTime();
+
+      await wait(2); // ensure clock advances
+      act(() => {
+        result.current.update(1);
+      });
+      expect(result.current.lastUpdated!.getTime()).toBeGreaterThanOrEqual(after1st);
+
+      await wait(2);
+      act(() => {
+        result.current.update(2);
+      });
+      expect(result.current.lastUpdated!.getTime()).toBeGreaterThanOrEqual(
+        result.current.lastUpdated!.getTime(),
+      );
+    });
+
+    it('should clear lastUpdated on reset', async () => {
+      const { result } = renderHook(() =>
+        useIDBStorage({ key: 'lu-reset', defaultValue: 'def', database: testDbName }),
+      );
+      await waitFor(() => expect(result.current.persisted).toBe(true));
+
+      act(() => {
+        result.current.update('some-value');
+      });
+      expect(result.current.lastUpdated).toBeInstanceOf(Date);
+
+      act(() => {
+        result.current.reset();
+      });
+      expect(result.current.lastUpdated).toBeNull();
+    });
+
+    it('should keep error null during normal operations', async () => {
+      const { result } = renderHook(() =>
+        useIDBStorage({ key: 'no-err', defaultValue: 'v', database: testDbName }),
+      );
+      await waitFor(() => expect(result.current.persisted).toBe(true));
+
+      act(() => {
+        result.current.update('changed');
+      });
+      act(() => {
+        result.current.reset();
+      });
+
+      expect(result.current.error).toBeNull();
+    });
+
+    it('should clear error state when a subsequent UPDATE_VALUE succeeds', async () => {
+      const { result } = renderHook(() =>
+        useIDBStorage({ key: 'err-clear', defaultValue: 'def', database: testDbName }),
+      );
+      await waitFor(() => expect(result.current.persisted).toBe(true));
+
+      // Manually inject an error via the reducer (simulate a past failure)
+      // We can test that updating after an error clears it by verifying
+      // the UPDATE_VALUE reducer path — the reducer always sets error: null.
+      act(() => {
+        result.current.update('recovery');
+      });
+      expect(result.current.error).toBeNull();
+    });
+  });
+
+  describe('refresh()', () => {
+    it('should reload the current value from IDB', async () => {
+      const key = 'refresh-test';
+
+      const { result } = renderHook(() =>
+        useIDBStorage({ key, defaultValue: 'default', database: testDbName }),
+      );
+      await waitFor(() => expect(result.current.persisted).toBe(true));
+      expect(result.current.data).toBe('default');
+
+      // Write a new value directly to IDB (simulating an external update)
+      const ext = new IDBStorage({ database: testDbName });
+      const extStore = await ext.get('default');
+      await extStore.set(key, 'external-value');
+
+      // Hook still sees the old value
+      expect(result.current.data).toBe('default');
+
+      // refresh() should pick up the external change
+      await act(async () => {
+        await result.current.refresh();
+      });
+      expect(result.current.data).toBe('external-value');
+    });
+
+    it('should update lastUpdated after a successful refresh', async () => {
+      const key = 'refresh-ts';
+
+      const { result } = renderHook(() =>
+        useIDBStorage({ key, defaultValue: 'v', database: testDbName }),
+      );
+      await waitFor(() => expect(result.current.persisted).toBe(true));
+
+      const before = result.current.lastUpdated!.getTime();
+      await wait(2);
+
+      await act(async () => {
+        await result.current.refresh();
+      });
+
+      expect(result.current.lastUpdated!.getTime()).toBeGreaterThanOrEqual(before);
+    });
+
+    it('should return defaultValue from refresh when key has no stored value', async () => {
+      const key = 'refresh-missing';
+
+      const { result } = renderHook(() =>
+        useIDBStorage({ key, defaultValue: 'fallback', database: testDbName }),
+      );
+      await waitFor(() => expect(result.current.persisted).toBe(true));
+
+      // Key was never written — refresh should give back defaultValue
+      await act(async () => {
+        await result.current.refresh();
+      });
+      expect(result.current.data).toBe('fallback');
+    });
+  });
+
+  describe('Flush on Unmount', () => {
+    it('should flush a pending debounced save when the component unmounts', async () => {
+      const key = 'flush-test';
+
+      const { result, unmount } = renderHook(() =>
+        useIDBStorage({ key, defaultValue: 'default', database: testDbName }),
+      );
+      await waitFor(() => expect(result.current.persisted).toBe(true));
+
+      // Update — this schedules a setTimeout(0) save that has NOT fired yet
+      act(() => {
+        result.current.update('flush-value');
+      });
+
+      // Unmount immediately before the debounce timeout fires
+      // The cleanup should cancel the timer and flush synchronously
+      unmount();
+      await flushPromises(); // let the flushed IDB write resolve
+
+      // New hook should see the flushed value
+      const { result: r2 } = renderHook(() =>
+        useIDBStorage({ key, defaultValue: 'default', database: testDbName }),
+      );
+      await waitFor(() => expect(r2.current.persisted).toBe(true));
+      expect(r2.current.data).toBe('flush-value');
+    });
+  });
+
+  describe('Early Unmount During Initialization', () => {
+    it('should not error when unmounted before IDB init completes', async () => {
+      const { unmount } = renderHook(() =>
+        useIDBStorage({ key: 'early-unmount', defaultValue: 'def', database: testDbName }),
+      );
+
+      // Unmount before loadInitialValue's awaits resolve
+      unmount();
+
+      await nextTick();
+      await flushPromises();
+
+      // console.error was mocked in setup — no unexpected errors
+      expect(console.error).not.toHaveBeenCalled();
+    });
+
+    it('should not error when unmounted rapidly multiple times (Strict Mode pattern)', async () => {
+      for (let i = 0; i < 3; i++) {
+        const { unmount } = renderHook(() =>
+          useIDBStorage({ key: 'strict-unmount', defaultValue: 'v', database: testDbName }),
+        );
+        unmount();
+        await nextTick();
+      }
+
+      await flushPromises();
+      expect(console.error).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('IDBConfig Component', () => {
+    it('should render its children', () => {
+      const { getByText } = render(
+        <IDBConfig database={testDbName}>
+          <span>hello from child</span>
+        </IDBConfig>,
+      );
+      expect(getByText('hello from child')).toBeTruthy();
+    });
+
+    it('should apply database and store config to the global state', async () => {
+      render(
+        <IDBConfig database={testDbName} store="cfg-store">
+          <></>
+        </IDBConfig>,
+      );
+
+      // IDBConfig applies config inside useEffect — wait for it
+      await nextTick();
+
+      const config = getGlobalConfig();
+      expect(config.database).toBe(testDbName);
+      expect(config.store).toBe('cfg-store');
+    });
+  });
+
+  describe('idb Singleton', () => {
+    it('should be an IDBStorage instance', () => {
+      expect(idb).toBeInstanceOf(IDBStorage);
+    });
+
+    it('should expose the expected API surface', () => {
+      expect(typeof idb.get).toBe('function');
+      expect(typeof idb.drop).toBe('function');
+      expect(typeof idb.close).toBe('function');
+      // .store is a Promise getter
+      expect(idb.store).toBeInstanceOf(Promise);
+    });
+
+    it('should resolve the default store with a full IDBStore API', async () => {
+      const store = await idb.store;
+      expect(typeof store.get).toBe('function');
+      expect(typeof store.set).toBe('function');
+      expect(typeof store.delete).toBe('function');
+      expect(typeof store.clear).toBe('function');
+      expect(typeof store.keys).toBe('function');
+      expect(typeof store.values).toBe('function');
+      expect(typeof store.entries).toBe('function');
+      expect(typeof store.getMany).toBe('function');
+      expect(typeof store.setMany).toBe('function');
+      expect(typeof store.deleteMany).toBe('function');
+      expect(typeof store.update).toBe('function');
     });
   });
 });

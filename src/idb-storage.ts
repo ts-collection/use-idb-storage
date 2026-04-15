@@ -240,18 +240,26 @@ export class IDBStorage {
    */
   private async getDB(): Promise<IDBDatabase> {
     if (this.db) return this.db;
-
     if (this.dbPromise) return this.dbPromise;
 
-    this.dbPromise = openDB(this.config.database, this.config.store, () => {
-      // Reset the cached db when version changes
-      this.db = null;
-      this.dbPromise = null;
-    });
-    this.db = await this.dbPromise;
-    this.dbPromise = null;
+    this.dbPromise = openDB(
+      this.config.database,
+      this.config.store,
+      () => {
+        this.db = null;
+        this.dbPromise = null;
+      },
+      this.config.version,
+    );
 
-    return this.db;
+    try {
+      this.db = await this.dbPromise;
+      this.dbPromise = null;
+      return this.db;
+    } catch (err) {
+      this.dbPromise = null;
+      throw err;
+    }
   }
 
   /**

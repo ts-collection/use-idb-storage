@@ -1,6 +1,10 @@
 // Singleton database connections cache
 const dbConnections = new Map<string, Promise<IDBDatabase>>();
 
+const IDB_OPEN_TIMEOUT_MS = 2000;
+const IDB_OPEN_RETRIES = 2;
+const IDB_RETRY_DELAY_MS = 500;
+
 /**
  * Check if IndexedDB is available
  */
@@ -10,13 +14,15 @@ export function isIDBAvailable(): boolean {
 
 /**
  * Opens an IndexedDB database and ensures the specified store exists.
- * Uses singleton pattern to reuse connections for the same database and version.
- * Automatically increments version if the store doesn't exist.
+ * Uses singleton pattern to reuse connections for the same database.
+ * Retries up to IDB_OPEN_RETRIES times on failure (blocked or timeout).
+ * When version is omitted, auto-upgrades if the store doesn't exist.
  */
 export function openDB(
   dbName: string,
   storeName: string,
   onVersionChange?: () => void,
+  version?: number,
 ): Promise<IDBDatabase> {
   if (!isIDBAvailable()) {
     throw new Error('IndexedDB is not available in this environment');
@@ -27,27 +33,75 @@ export function openDB(
     return dbConnections.get(key)!;
   }
 
-  const dbPromise = _openDB(dbName, storeName, onVersionChange);
+  const dbPromise = _openDBWithRetry(
+    dbName,
+    storeName,
+    onVersionChange,
+    version,
+    IDB_OPEN_RETRIES,
+  );
   dbConnections.set(key, dbPromise);
+  dbPromise.catch(() => dbConnections.delete(key));
 
   return dbPromise;
 }
 
+async function _openDBWithRetry(
+  dbName: string,
+  storeName: string,
+  onVersionChange: (() => void) | undefined,
+  version: number | undefined,
+  retriesLeft: number,
+): Promise<IDBDatabase> {
+  try {
+    return await _openDB(dbName, storeName, onVersionChange, version);
+  } catch (err) {
+    if (retriesLeft > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, IDB_RETRY_DELAY_MS));
+      return _openDBWithRetry(dbName, storeName, onVersionChange, version, retriesLeft - 1);
+    }
+    throw err;
+  }
+}
+
 /**
- * Internal function to open database with proper store handling
+ * Single open attempt with timeout. Cache management is handled by openDB.
  */
 function _openDB(
   dbName: string,
   storeName: string,
   onVersionChange?: () => void,
+  version?: number,
 ): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(dbName, undefined);
+    const timer = setTimeout(() => {
+      reject(new Error(`IndexedDB open timed out for "${dbName}"`));
+    }, IDB_OPEN_TIMEOUT_MS);
 
-    request.onerror = () => {
-      const key = `${dbName}:${storeName}`;
-      dbConnections.delete(key);
-      reject(request.error);
+    const settle = (fn: () => void) => {
+      clearTimeout(timer);
+      fn();
+    };
+
+    const attachVersionChange = (db: IDBDatabase) => {
+      db.onversionchange = () => {
+        db.close();
+        for (const [k] of dbConnections) {
+          if (k.startsWith(`${dbName}:`)) dbConnections.delete(k);
+        }
+        onVersionChange?.();
+      };
+    };
+
+    const request = indexedDB.open(dbName, version);
+
+    request.onerror = () => settle(() => reject(request.error));
+
+    request.onblocked = () => {
+      // Another tab holds a connection; log and wait — timeout is the safety net
+      console.warn(
+        `[use-idb-storage] IndexedDB open blocked for "${dbName}" — another tab may be holding a connection`,
+      );
     };
 
     request.onupgradeneeded = (event) => {
@@ -60,49 +114,39 @@ function _openDB(
     request.onsuccess = () => {
       const db = request.result;
 
-      // Check if store exists, if not, we need to upgrade
-      if (!db.objectStoreNames.contains(storeName)) {
+      // When no explicit version: if the store still doesn't exist, upgrade
+      if (!version && !db.objectStoreNames.contains(storeName)) {
         db.close();
-        const key = `${dbName}:${storeName}`;
-        dbConnections.delete(key);
-        // Try with higher version
         const request2 = indexedDB.open(dbName, db.version + 1);
+
         request2.onupgradeneeded = (event) => {
           const db2 = (event.target as IDBOpenDBRequest).result;
           if (!db2.objectStoreNames.contains(storeName)) {
             db2.createObjectStore(storeName);
           }
         };
-        request2.onsuccess = () => {
-          const db2 = request2.result;
-          db2.onversionchange = () => {
-            db2.close();
-            for (const [k] of dbConnections) {
-              if (k.startsWith(`${dbName}:`)) {
-                dbConnections.delete(k);
-              }
-            }
-            onVersionChange?.();
-          };
-          resolve(db2);
+
+        request2.onblocked = () => {
+          console.warn(
+            `[use-idb-storage] IndexedDB upgrade blocked for "${dbName}" — another tab may be holding a connection`,
+          );
         };
-        request2.onerror = () => reject(request2.error);
+
+        request2.onsuccess = () =>
+          settle(() => {
+            attachVersionChange(request2.result);
+            resolve(request2.result);
+          });
+
+        request2.onerror = () => settle(() => reject(request2.error));
+
         return;
       }
 
-      // Handle version changes
-      db.onversionchange = () => {
-        db.close();
-        // Clear all connections for this db
-        for (const [key] of dbConnections) {
-          if (key.startsWith(`${dbName}:`)) {
-            dbConnections.delete(key);
-          }
-        }
-        onVersionChange?.();
-      };
-
-      resolve(db);
+      settle(() => {
+        attachVersionChange(db);
+        resolve(db);
+      });
     };
   });
 }

@@ -148,11 +148,8 @@ export function useIDBStorage<T>(
             .catch(console.error);
         }
       }
-      if (storageRef.current) {
-        storageRef.current.close();
-        storageRef.current = null;
-        storeRef.current = null;
-      }
+      storageRef.current = null;
+      storeRef.current = null;
     };
   }, [conf.database, conf.version, conf.store, key]);
 

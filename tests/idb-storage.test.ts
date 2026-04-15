@@ -309,10 +309,38 @@ describe('IDBStorage', () => {
     });
   });
 
-  // Skip tests that require multiple stores due to fake-indexeddb limitations
-  describe.skip('Multiple Stores', () => {
-    it('should handle multiple stores independently', async () => {
-      // Skipped due to fake-indexeddb limitations
+  describe('Multiple Databases', () => {
+    it('should isolate data between different database names', async () => {
+      const dbA = `${testDbName}-a`;
+      const dbB = `${testDbName}-b`;
+
+      const storageA = new IDBStorage({ database: dbA });
+      const storageB = new IDBStorage({ database: dbB });
+
+      const storeA = await storageA.get('default');
+      const storeB = await storageB.get('default');
+
+      await storeA.set('key', 'value-from-a');
+      await storeB.set('key', 'value-from-b');
+
+      expect(await storeA.get('key')).toBe('value-from-a');
+      expect(await storeB.get('key')).toBe('value-from-b');
+    });
+
+    it('should not share keys between different database names', async () => {
+      const dbA = `${testDbName}-c`;
+      const dbB = `${testDbName}-d`;
+
+      const storageA = new IDBStorage({ database: dbA });
+      const storageB = new IDBStorage({ database: dbB });
+
+      const storeA = await storageA.get('default');
+      const storeB = await storageB.get('default');
+
+      await storeA.set('exclusive', 'only-in-a');
+
+      expect(await storeA.get('exclusive')).toBe('only-in-a');
+      expect(await storeB.get('exclusive')).toBeUndefined();
     });
   });
 
@@ -359,8 +387,15 @@ describe('IDBStorage', () => {
       storage.close();
     });
 
-    it.skip('should handle transaction errors', async () => {
-      // Skipped due to fake-indexeddb limitations
+    it('should propagate errors thrown during set', async () => {
+      const storage = new IDBStorage({ database: testDbName });
+      const store = await storage.get('default');
+
+      // Corrupt the internal db reference to force a transaction error
+      (store as any).db = null;
+
+      await expect(store.set('key', 'val')).rejects.toThrow();
+      await expect(store.get('key')).rejects.toThrow();
     });
   });
 
@@ -392,6 +427,115 @@ describe('IDBStorage', () => {
 
       // After closing, operations should still work (fake-indexeddb behavior)
       // In real IndexedDB, this would fail, but fake-indexeddb allows it
+    });
+
+    it('should share the same underlying connection between instances of the same database', async () => {
+      const storageA = new IDBStorage({ database: testDbName });
+      const storageB = new IDBStorage({ database: testDbName });
+
+      const storeA = await storageA.get('default');
+      const storeB = await storageB.get('default');
+
+      await storeA.set('shared', 'written-by-a');
+      expect(await storeB.get('shared')).toBe('written-by-a');
+
+      await storeB.set('shared', 'written-by-b');
+      expect(await storeA.get('shared')).toBe('written-by-b');
+    });
+  });
+
+  describe('Data Types', () => {
+    let storage: IDBStorage;
+    let store: Awaited<ReturnType<IDBStorage['get']>>;
+
+    beforeEach(async () => {
+      storage = new IDBStorage({ database: testDbName });
+      store = await storage.get('default');
+    });
+
+    afterEach(() => {
+      storage.close();
+    });
+
+    it.each([
+      ['non-empty string', 'hello world'],
+      ['empty string', ''],
+      ['unicode + emoji', '你好世界 🌍'],
+      ['integer', 42],
+      ['negative integer', -99],
+      ['float', 3.14159],
+      ['zero', 0],
+      ['boolean true', true],
+      ['boolean false', false],
+      ['null', null],
+      ['empty array', []],
+      ['array with mixed types', [1, 'two', { three: 3 }]],
+      ['plain object', { a: 1, b: 'two' }],
+      ['deeply nested object', { outer: { inner: { deep: [1, 2, 3] } } }],
+    ])('should round-trip %s', async (_label, value) => {
+      await store.set('type-test', value);
+      expect(await store.get('type-test')).toEqual(value);
+    });
+
+    it('should round-trip a Date object', async () => {
+      const date = new Date('2024-06-15T12:00:00.000Z');
+      await store.set('date-key', date);
+      const retrieved = await store.get<Date>('date-key');
+      expect(retrieved).toBeInstanceOf(Date);
+      expect(retrieved?.getTime()).toBe(date.getTime());
+    });
+
+    it('should round-trip a large object (1 000 items)', async () => {
+      const large = {
+        items: Array.from({ length: 1000 }, (_, i) => ({ id: i, label: `item-${i}` })),
+      };
+      await store.set('large', large);
+      expect(await store.get('large')).toEqual(large);
+    });
+
+    it('should overwrite an existing key', async () => {
+      await store.set('ow', 'first');
+      await store.set('ow', 'second');
+      expect(await store.get('ow')).toBe('second');
+    });
+
+    it('should return empty results on a fresh store', async () => {
+      expect(await store.keys()).toEqual([]);
+      expect(await store.values()).toEqual([]);
+      expect(await store.entries()).toEqual([]);
+    });
+
+    it('should return undefined for a key that was never written', async () => {
+      expect(await store.get('does-not-exist')).toBeUndefined();
+    });
+  });
+
+  describe('drop()', () => {
+    it('should clear all records from the target store', async () => {
+      const storage = new IDBStorage({ database: testDbName });
+      const store = await storage.get('default');
+
+      await store.set('k1', 'v1');
+      await store.set('k2', 'v2');
+      expect(await store.keys()).toHaveLength(2);
+
+      await storage.drop('default');
+      expect(await store.keys()).toEqual([]);
+    });
+
+    it('should not affect other databases', async () => {
+      const storageA = new IDBStorage({ database: `${testDbName}-drop-a` });
+      const storageB = new IDBStorage({ database: `${testDbName}-drop-b` });
+      const storeA = await storageA.get('default');
+      const storeB = await storageB.get('default');
+
+      await storeA.set('k', 'v');
+      await storeB.set('k', 'v');
+
+      await storageA.drop('default');
+
+      expect(await storeA.get('k')).toBeUndefined();
+      expect(await storeB.get('k')).toBe('v');
     });
   });
 });
