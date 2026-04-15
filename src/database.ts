@@ -66,6 +66,8 @@ async function _openDBWithRetry(
 
 /**
  * Single open attempt with timeout. Cache management is handled by openDB.
+ * Handles VersionError by falling back to the current DB version.
+ * Handles missing stores by upgrading to the next version.
  */
 function _openDB(
   dbName: string,
@@ -93,61 +95,52 @@ function _openDB(
       };
     };
 
-    const request = indexedDB.open(dbName, version);
+    // Inner helper — opens at `ver` (undefined = current) and ensures the store exists.
+    // On VersionError (requested < current) retries without version once.
+    const openAt = (ver: number | undefined, isRetry = false) => {
+      const req = indexedDB.open(dbName, ver);
 
-    request.onerror = () => settle(() => reject(request.error));
+      req.onblocked = () => {
+        console.warn(
+          `[use-idb-storage] IndexedDB open blocked for "${dbName}" — another tab may be holding a connection`,
+        );
+      };
 
-    request.onblocked = () => {
-      // Another tab holds a connection; log and wait — timeout is the safety net
-      console.warn(
-        `[use-idb-storage] IndexedDB open blocked for "${dbName}" — another tab may be holding a connection`,
-      );
+      req.onupgradeneeded = (event) => {
+        const db = (event.target as IDBOpenDBRequest).result;
+        if (!db.objectStoreNames.contains(storeName)) {
+          db.createObjectStore(storeName);
+        }
+      };
+
+      req.onerror = () => {
+        const error = req.error;
+        // If the DB exists at a higher version, reopen at current version (once)
+        if (error?.name === 'VersionError' && !isRetry) {
+          openAt(undefined, true);
+          return;
+        }
+        settle(() => reject(error));
+      };
+
+      req.onsuccess = () => {
+        const db = req.result;
+
+        // Store missing — upgrade to the next version to create it
+        if (!db.objectStoreNames.contains(storeName)) {
+          db.close();
+          openAt(db.version + 1);
+          return;
+        }
+
+        settle(() => {
+          attachVersionChange(db);
+          resolve(db);
+        });
+      };
     };
 
-    request.onupgradeneeded = (event) => {
-      const db = (event.target as IDBOpenDBRequest).result;
-      if (!db.objectStoreNames.contains(storeName)) {
-        db.createObjectStore(storeName);
-      }
-    };
-
-    request.onsuccess = () => {
-      const db = request.result;
-
-      // When no explicit version: if the store still doesn't exist, upgrade
-      if (!version && !db.objectStoreNames.contains(storeName)) {
-        db.close();
-        const request2 = indexedDB.open(dbName, db.version + 1);
-
-        request2.onupgradeneeded = (event) => {
-          const db2 = (event.target as IDBOpenDBRequest).result;
-          if (!db2.objectStoreNames.contains(storeName)) {
-            db2.createObjectStore(storeName);
-          }
-        };
-
-        request2.onblocked = () => {
-          console.warn(
-            `[use-idb-storage] IndexedDB upgrade blocked for "${dbName}" — another tab may be holding a connection`,
-          );
-        };
-
-        request2.onsuccess = () =>
-          settle(() => {
-            attachVersionChange(request2.result);
-            resolve(request2.result);
-          });
-
-        request2.onerror = () => settle(() => reject(request2.error));
-
-        return;
-      }
-
-      settle(() => {
-        attachVersionChange(db);
-        resolve(db);
-      });
-    };
+    openAt(version);
   });
 }
 

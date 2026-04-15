@@ -18,7 +18,11 @@ export const IDBConfig = ({
   store,
 }: { children: React.ReactNode } & Partial<IDBConfigValues>) => {
   React.useEffect(() => {
-    configureIDBStorage({ database, version, store });
+    const config: Partial<IDBConfigValues> = {};
+    if (database !== undefined) config['database'] = database;
+    if (version !== undefined) config['version'] = version;
+    if (store !== undefined) config['store'] = store;
+    configureIDBStorage(config);
   }, [database, version, store]);
 
   return children;

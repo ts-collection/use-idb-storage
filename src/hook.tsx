@@ -86,7 +86,6 @@ export function useIDBStorage<T>(
   const pendingValueRef = React.useRef<T | null>(null);
   const hasLoadedRef = React.useRef(false);
   const initialValueRef = React.useRef<T | null>(null);
-  const isFromIDBRef = React.useRef(false);
 
   React.useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -113,7 +112,6 @@ export function useIDBStorage<T>(
 
         const value = await storeInstance.get<T>(key);
         if (isMounted) {
-          isFromIDBRef.current = true;
           dispatch({
             type: 'LOAD_VALUE',
             value: value !== undefined ? value : defaultValue,
@@ -195,20 +193,6 @@ export function useIDBStorage<T>(
     [key],
   );
 
-  // Save to IDB when value changes (after renders)
-  React.useEffect(() => {
-    if (
-      !isInitializedRef.current ||
-      !hasLoadedRef.current ||
-      isFromIDBRef.current
-    ) {
-      isFromIDBRef.current = false;
-      return;
-    }
-
-    saveToIDB(state.value);
-  }, [state.value, saveToIDB]);
-
   const updateStoredValue = React.useCallback(
     (valueOrFn: T | ((prevState: T) => T)) => {
       const newValue =
@@ -217,21 +201,22 @@ export function useIDBStorage<T>(
           : valueOrFn;
 
       dispatch({ type: 'UPDATE_VALUE', value: newValue });
+      saveToIDB(newValue);
     },
-    [state.value],
+    [state.value, saveToIDB],
   );
 
   const removeStoredValue = React.useCallback(() => {
     dispatch({ type: 'RESET', defaultValue });
     initialValueRef.current = defaultValue;
-  }, [defaultValue]);
+    saveToIDB(defaultValue);
+  }, [defaultValue, saveToIDB]);
 
   const refresh = React.useCallback(async () => {
     if (!isIDBAvailable() || !storeRef.current) return;
 
     try {
       const value = await storeRef.current.get<T>(key);
-      isFromIDBRef.current = true;
       dispatch({
         type: 'REFRESH_SUCCESS',
         value: value !== undefined ? value : defaultValue,
